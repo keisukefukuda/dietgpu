@@ -150,6 +150,7 @@ std::tuple<torch::Tensor, torch::Tensor, int64_t> compress_data_res(
     bool compressAsFloat,
     StackDeviceMemory& res,
     const std::vector<torch::Tensor>& tIns,
+    const std::optional<torch::Tensor>& histogram_dev,
     bool checksum,
     const std::optional<torch::Tensor>& outCompressed,
     const std::optional<torch::Tensor>& outCompressedSizes) {
@@ -181,6 +182,21 @@ std::tuple<torch::Tensor, torch::Tensor, int64_t> compress_data_res(
           getFloatTypeFromDtype(t.dtype().toScalarType()) !=
           FloatType::kUndefined);
     }
+  }
+
+  //
+  // Validate histogram / construct pointer
+  //
+  const uint32_t* histogram_ptr = nullptr;
+  if (histogram_dev) {
+    TORCH_CHECK(histogram_dev->device().type() == at::kCUDA);
+    TORCH_CHECK(histogram_dev->is_contiguous());
+    TORCH_CHECK(histogram_dev->dtype() == torch::kInt32);
+    TORCH_CHECK(histogram_dev->get_device() == dev);
+
+    histogram_ptr = (const uint32_t*)histogram_dev->data_ptr();
+  } else {
+    histogram_ptr = nullptr;
   }
 
   torch::Tensor comp;
@@ -262,7 +278,7 @@ std::tuple<torch::Tensor, torch::Tensor, int64_t> compress_data_res(
         tIns.size(),
         inPtrs.data(),
         inSize.data(),
-        nullptr,
+        histogram_ptr,
         compPtrs.data(),
         // FIXME: int32_t versus uint32_t
         (uint32_t*)sizes.data_ptr(),
@@ -277,6 +293,7 @@ std::tuple<torch::Tensor, torch::Tensor, int64_t> compress_data_res(
 std::tuple<torch::Tensor, torch::Tensor, int64_t> compress_data(
     bool compressAsFloat,
     const std::vector<torch::Tensor>& tIns,
+    const std::optional<torch::Tensor>& histogram_dev,
     bool checksum,
     const std::optional<torch::Tensor>& tempMem,
     const std::optional<torch::Tensor>& outCompressed,
@@ -304,7 +321,7 @@ std::tuple<torch::Tensor, torch::Tensor, int64_t> compress_data(
 
   // The rest of the validation takes place here
   return compress_data_res(
-      compressAsFloat, res, tIns, checksum, outCompressed, outCompressedSizes);
+      compressAsFloat, res, tIns, histogram_dev, checksum, outCompressed, outCompressedSizes);
 }
 
 std::tuple<std::vector<torch::Tensor>, torch::Tensor, int64_t>
@@ -462,6 +479,7 @@ compress_data_split_size(
 std::vector<torch::Tensor> compress_data_simple(
     bool compressAsFloat,
     const std::vector<torch::Tensor>& tIns,
+    const std::optional<torch::Tensor>& histogram_dev,
     bool checksum,
     const std::optional<int64_t>& tempMem) {
   TORCH_CHECK(!tIns.empty());
@@ -477,12 +495,13 @@ std::vector<torch::Tensor> compress_data_simple(
 
     // rest of validation takes place here
     comp = compress_data(
-        compressAsFloat, tIns, checksum, scratch, std::nullopt, std::nullopt);
+        compressAsFloat, tIns, histogram_dev, checksum, scratch, std::nullopt, std::nullopt);
   } else {
     // rest of validation takes place here
     comp = compress_data(
         compressAsFloat,
         tIns,
+        histogram_dev,
         checksum,
         std::nullopt,
         std::nullopt,
