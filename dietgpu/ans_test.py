@@ -33,7 +33,9 @@ def run_test(dev, ts, checksum, temp_mem=None):
         out_status = torch.empty([len(ts)], dtype=torch.uint8, device=dev)
         out_sizes = torch.empty([len(ts)], dtype=torch.int32, device=dev)
 
-        torch.ops.dietgpu.decompress_data(False, truncated_comp, out_ts, checksum, temp_mem, out_status, out_sizes)
+        torch.ops.dietgpu.decompress_data(
+            False, truncated_comp, out_ts, checksum, temp_mem, out_status, out_sizes
+        )
 
         for t, status, size in zip(ts, out_status, out_sizes):
             assert status.item()
@@ -106,7 +108,9 @@ class TestANSCodec(unittest.TestCase):
             sizes_t = torch.IntTensor(sizes)
             splits = torch.split(t, sizes)
 
-            comp_ts, _, _ = torch.ops.dietgpu.compress_data_split_size(False, t, sizes_t, True, temp_mem)
+            comp_ts, _, _ = torch.ops.dietgpu.compress_data_split_size(
+                False, t, sizes_t, True, temp_mem
+            )
             decomp_ts = torch.ops.dietgpu.decompress_data_simple(False, comp_ts, True)
 
             for orig, decomp in zip(splits, decomp_ts):
@@ -136,6 +140,8 @@ class TestANSCodec(unittest.TestCase):
             comp_ts = torch.ops.dietgpu.compress_data_simple(False, splits, True)
 
             decomp_t = torch.empty([sum_sizes], dtype=torch.uint8, device=dev)
-            torch.ops.dietgpu.decompress_data_split_size(False, comp_ts, decomp_t, sizes_t, True, temp_mem)
+            torch.ops.dietgpu.decompress_data_split_size(
+                False, comp_ts, decomp_t, sizes_t, True, temp_mem
+            )
 
             assert torch.equal(t, decomp_t)
