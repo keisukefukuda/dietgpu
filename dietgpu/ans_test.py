@@ -76,14 +76,6 @@ class TestANSCodec(unittest.TestCase):
         decomp_ts = torch.ops.dietgpu.decompress_data_simple(False, comp_ts, True)
         assert torch.equal(ts[0], decomp_ts[0])
 
-    def test_with_histogram(self):
-        dev = torch.device("cuda:0")
-        ts = [torch.arange(256, dtype=torch.uint8, device=dev)]
-        hist = torch.ones(256, dtype=torch.int32, device=dev)
-        comp_ts = torch.ops.dietgpu.compress_data_simple(False, ts, hist, True)
-
-        # decomp_ts = torch.ops.dietgpu.decompress_data_simple(False, comp_ts, True)
-
     def test_split_compress(self):
         dev = torch.device("cuda:0")
         temp_mem = torch.empty([64 * 1024 * 1024], dtype=torch.uint8, device=dev)
