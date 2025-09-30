@@ -172,6 +172,44 @@ blockSum(int warpId, int laneId, int valForSum, int* smem) {
   return smem[0];
 }
 
+template <int Threads>
+__device__ void buildTableFromCdf(
+    const uint32_t* __restrict__ cdf,  // len: kNumSymbols
+    int probBits,
+    uint4* __restrict__ table)         // len: kNumSymbols
+{
+  static_assert(
+      kNumSymbols == Threads || isEvenDivisor(kNumSymbols, uint32_t(Threads)),
+      "");
+
+  constexpr int kNumSymPerThread =
+      (kNumSymbols == Threads) ? 1 : (kNumSymbols / Threads);
+
+  const uint32_t kProbWeight = (1u << probBits);
+  const int tid = threadIdx.x;
+
+#pragma unroll
+  for (int i = 0; i < kNumSymPerThread; ++i) {
+    const int curSym = tid * kNumSymPerThread + i;
+    if (curSym >= kNumSymbols) continue;
+
+    const uint32_t start = cdf[curSym];
+    const uint32_t next  = (curSym + 1 < kNumSymbols) ? cdf[curSym + 1]
+                                                      : kProbWeight;
+    const uint32_t pdf   = next - start;
+
+    uint32_t shift = 0, magic = 0;
+    if (pdf > 1) {
+      shift = 32 - __clz(pdf - 1);
+      constexpr uint64_t one = 1ull;
+      const uint64_t magic64 =
+          ((one << 32) * ((one << shift) - (uint64_t)pdf)) / (uint64_t)pdf + 1ull;
+      magic = (uint32_t)magic64;
+    }
+    table[curSym] = uint4{pdf, start, magic, shift};
+  }
+}
+
 // Function that allows normalization of symbol probabilities with a varying
 // (statically known) number of threads, to allow for kernel fusion as needed
 // Stand-alone normalization will use Threads == kNumSymbols (256)
@@ -339,31 +377,18 @@ __device__ void normalizeProbabilitiesFromHistogram(
   // FIXME: initialize to 0?
   uint32_t symCdf[kNumSymPerThread];
   Scan(smemScan).ExclusiveSum(symPdf, symCdf);
-
-  // Compute divisor information (constant division via integer
-  // multiplication + shift)
-  uint32_t shift[kNumSymPerThread];
-  uint32_t magic[kNumSymPerThread];
+  __shared__ uint32_t smemCdf[kNumSymbols];
 
 #pragma unroll
   for (int i = 0; i < kNumSymPerThread; ++i) {
-    shift[i] = 32 - __clz(symPdf[i] - 1);
-
-    constexpr uint64_t one = 1;
-    uint64_t magic64 =
-        ((one << 32) * ((one << shift[i]) - symPdf[i])) / symPdf[i] + 1;
-
-    // should not overflow
-    magic[i] = (uint32_t)magic64;
+    const int curSym = tid * kNumSymPerThread + i;
+    if (curSym < kNumSymbols) {
+      smemCdf[curSym] = symCdf[i];
+    }
   }
+  __syncthreads();
 
-#pragma unroll
-  for (int i = 0; i < kNumSymPerThread; ++i) {
-    // Same blocked contiguous ordering as before
-    // Note that this is no longer a coalesced write
-    int curSym = tid * kNumSymPerThread + i;
-    table[curSym] = uint4{symPdf[i], symCdf[i], magic[i], shift[i]};
-  }
+  buildTableFromCdf<Threads>(smemCdf, probBits, table);
 }
 
 template <typename SizeProvider, int Threads>
@@ -379,6 +404,24 @@ __global__ void quantizeWeights(
       sizeProvider.getBatchSize(batch),
       probBits,
       table + batch * kNumSymbols);
+}
+
+template <int Threads, typename SizeProviderDummy = int>
+__global__ void quantizeWeightsFromCdf(
+    const uint32_t* __restrict__ cdfs,  // [numBatches, kNumSymbols] → [numBatches, kNumTables, kNumSymbols]
+    int probBits,
+    uint4* __restrict__ table)          // [numBatches, kNumSymbols] → [numBatches, kNumTables, kNumSymbols]
+{
+  const int batch = blockIdx.x;
+  const uint32_t* cdfBatch = cdfs + batch * (kNumTables * kNumSymbols);
+  uint4*   tableBatch = table + batch * (kNumTables * kNumSymbols);
+
+  #pragma unroll
+  for (int t = 0; t < kNumTables; ++t) {
+    const uint32_t* cdfT = cdfBatch + t * kNumSymbols;
+    uint4*   tableT = tableBatch + t * kNumSymbols;
+    buildTableFromCdf<Threads>(cdfT, probBits, tableT);
+  }
 }
 
 template <typename InProvider>
@@ -418,15 +461,17 @@ inline void ansCalcWeights(
     // we only use this for sizes (of each input batch member)
     SizeProvider sizeProvider,
     // size numInBatch * kNumSymbols
-    const uint32_t* histogram_dev,
+    // const uint32_t* histogram_dev,
+    // size numInBatch * kNumSymbols
+    const uint32_t* cdfs_dev,
     // size numInBatch * kNumSymbols
     uint4* table_dev,
     cudaStream_t stream) {
   // Quantize weights and determine integer ANS division factors
   constexpr int kThreads = kNumSymbols;
 
-  quantizeWeights<SizeProvider, kThreads><<<numInBatch, kThreads, 0, stream>>>(
-      histogram_dev, sizeProvider, probBits, table_dev);
+  quantizeWeightsFromCdf<kThreads><<<numInBatch, kThreads, 0, stream>>>(
+      cdfs_dev, probBits, table_dev);      
 }
 
 } // namespace dietgpu

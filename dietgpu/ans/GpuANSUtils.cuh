@@ -33,6 +33,8 @@ struct __align__(4) ANSDecodedTx4 {
 constexpr uint32_t kNumSymbols = 1 << (sizeof(ANSDecodedT) * 8);
 static_assert(kNumSymbols > 1, "");
 
+constexpr uint32_t kNumTables  = 2;
+
 // Default block size for compression (in bytes)
 constexpr uint32_t kDefaultBlockSize = 4096;
 
@@ -73,7 +75,7 @@ struct __align__(32) ANSCoalescedHeader {
 
     return sizeof(ANSCoalescedHeader) +
         // probs
-        sizeof(uint16_t) * kNumSymbols +
+        sizeof(uint16_t) * kNumTables * kNumSymbols +
         // states
         sizeof(ANSWarpState) * numBlocks +
         // block words
@@ -161,11 +163,11 @@ struct __align__(32) ANSCoalescedHeader {
   }
 
   __device__ ANSWarpState* getWarpStates() {
-    return (ANSWarpState*)(getSymbolProbs() + kNumSymbols);
+    return (ANSWarpState*)(getSymbolProbs() + kNumTables * kNumSymbols);
   }
 
   __device__ const ANSWarpState* getWarpStates() const {
-    return (const ANSWarpState*)(getSymbolProbs() + kNumSymbols);
+    return (const ANSWarpState*)(getSymbolProbs() + kNumTables * kNumSymbols);
   }
 
   __device__ uint2* getBlockWords(uint32_t numBlocks) {

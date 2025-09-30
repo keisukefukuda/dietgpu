@@ -31,7 +31,7 @@ void ansEncodeBatchStride(
     const void* in_dev,
     uint32_t inPerBatchSize,
     uint32_t inPerBatchStride,
-    const uint32_t* histogram_dev,
+    const uint32_t* cdfs_dev,
     void* out_dev,
     uint32_t outPerBatchStride,
     uint32_t* outSize_dev,
@@ -45,7 +45,8 @@ void ansEncodeBatchStride(
       config,
       numInBatch,
       inProvider,
-      histogram_dev,
+      cdfs_dev,
+      inProvider, // TODO: indexProvider
       inPerBatchSize, // max size
       outProvider,
       outSize_dev,
@@ -58,7 +59,8 @@ void ansEncodeBatchPointer(
     uint32_t numInBatch,
     const void** in,
     const uint32_t* inSize,
-    const uint32_t* histogram_dev,
+    const uint32_t* cdfs_dev,
+    const void** index,
     void** out,
     uint32_t* outSize_dev,
     cudaStream_t stream) {
@@ -72,12 +74,20 @@ void ansEncodeBatchPointer(
 
   // Copy data to device
   auto in_dev = res.alloc<void*>(stream, numInBatch);
+  auto index_dev = res.alloc<void*>(stream, numInBatch);
   auto inSize_dev = res.alloc<uint32_t>(stream, numInBatch);
   auto out_dev = res.alloc<void*>(stream, numInBatch);
 
   CUDA_VERIFY(cudaMemcpyAsync(
       in_dev.data(),
       in,
+      numInBatch * sizeof(void*),
+      cudaMemcpyHostToDevice,
+      stream));
+
+  CUDA_VERIFY(cudaMemcpyAsync(
+      index_dev.data(),
+      index,
       numInBatch * sizeof(void*),
       cudaMemcpyHostToDevice,
       stream));
@@ -98,6 +108,7 @@ void ansEncodeBatchPointer(
 
   auto inProvider =
       BatchProviderPointer((void**)in_dev.data(), inSize_dev.data());
+  auto indexProvider = BatchProviderPointer(index_dev.data());
   auto outProvider = BatchProviderPointer(out_dev.data());
 
   ansEncodeBatchDevice(
@@ -105,7 +116,8 @@ void ansEncodeBatchPointer(
       config,
       numInBatch,
       inProvider,
-      histogram_dev,
+      cdfs_dev,
+      indexProvider,
       maxSize,
       outProvider,
       outSize_dev,
@@ -118,7 +130,8 @@ void ansEncodeBatchSplitSize(
     uint32_t numInBatch,
     const void* in_dev,
     const uint32_t* inSplitSizes,
-    const uint32_t* histogram_dev,
+    const uint32_t* cdfs_dev,
+    const void* index_dev,
     void* out_dev,
     uint32_t outStride,
     uint32_t* outSize_dev,
@@ -163,6 +176,12 @@ void ansEncodeBatchSplitSize(
       sizes_dev.data(),
       sizes_dev.data() + numInBatch,
       sizeof(uint8_t));
+  
+  auto indexProvider = BatchProviderSplitSize(
+      (void*)index_dev,
+      sizes_dev.data(), // 怪しいかも
+      sizes_dev.data() + numInBatch,
+      sizeof(uint8_t));
 
   auto outProvider = BatchProviderStride(out_dev, outStride);
 
@@ -171,7 +190,8 @@ void ansEncodeBatchSplitSize(
       config,
       numInBatch,
       inProvider,
-      histogram_dev,
+      cdfs_dev,
+      indexProvider,
       maxSplitSize,
       outProvider,
       outSize_dev,

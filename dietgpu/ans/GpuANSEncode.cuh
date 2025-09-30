@@ -51,10 +51,11 @@ template <int ProbBits>
 __device__ __forceinline__ uint32_t encodeOneWarp(
     ANSStateT& state,
     ANSDecodedT sym,
+    uint32_t table_idx,
     uint32_t outOffset,
     ANSEncodedT* __restrict__ out,
     const uint4* __restrict__ smemLookup) {
-  auto lookup = smemLookup[sym];
+  auto lookup = smemLookup[table_idx * kNumSymbols + sym]; 
 
   uint32_t pdf = lookup.x;
   uint32_t cdf = lookup.y;
@@ -98,10 +99,11 @@ __device__ __forceinline__ uint32_t encodeOnePartialWarp(
     bool valid,
     ANSStateT& state,
     ANSDecodedT sym,
+    uint32_t table_idx,
     uint32_t outOffset,
     ANSEncodedT* __restrict__ out,
     const uint4* __restrict__ smemLookup) {
-  auto lookup = smemLookup[sym];
+  auto lookup = smemLookup[table_idx * kNumSymbols + sym]; 
 
   uint32_t pdf = lookup.x;
   uint32_t cdf = lookup.y;
@@ -145,10 +147,12 @@ __device__ uint32_t ansEncodeWarpBlock(
     uint32_t laneId,
     // Input for this block
     const ANSDecodedT* __restrict__ in,
+    // symbol table index for this block
+    const uint32_t* __restrict__ index,
     // Number of ANSDecodedT words in this block
     uint32_t inWords,
     // encoded table in smem
-    const uint4* __restrict__ table,
+    const uint4* __restrict__ table, // [kNumTables * kNumSymbols]
     // Output for this block
     ANSWarpState* __restrict__ out) {
   // where we write the compressed words
@@ -166,17 +170,19 @@ __device__ uint32_t ansEncodeWarpBlock(
   uint32_t limit = roundDown(inWords, kWarpSize * kUnroll);
   {
     ANSDecodedT sym[kUnroll];
+    uint32_t table_idx[kUnroll];
 
     for (; inOffset < limit; inOffset += kWarpSize * kUnroll) {
 #pragma unroll
       for (int j = 0; j < kUnroll; ++j) {
         sym[j] = in[inOffset + j * kWarpSize];
+        table_idx[j] = index[inOffset + j * kWarpSize];
       }
 
 #pragma unroll
       for (int j = 0; j < kUnroll; ++j) {
         outOffset +=
-            encodeOneWarp<ProbBits>(state, sym[j], outOffset, outWords, table);
+            encodeOneWarp<ProbBits>(state, sym[j], table_idx[j], outOffset, outWords, table);
       }
     }
   }
@@ -188,9 +194,10 @@ __device__ uint32_t ansEncodeWarpBlock(
     // Whole warp iterations
     for (; inOffset < limit; inOffset += kWarpSize) {
       ANSDecodedT sym = in[inOffset];
+      uint32_t table_idx = index[inOffset];
 
       outOffset +=
-          encodeOneWarp<ProbBits>(state, sym, outOffset, outWords, table);
+          encodeOneWarp<ProbBits>(state, sym, table_idx, outOffset, outWords, table);
     }
 
     // Partial warp iteration
@@ -198,9 +205,10 @@ __device__ uint32_t ansEncodeWarpBlock(
       // Last iteration may not be a full warp
       bool valid = inOffset < inWords;
       ANSDecodedT sym = valid ? in[inOffset] : ANSDecodedT(0);
+      uint32_t table_idx = valid ? index[inOffset] : 0;
 
       outOffset += encodeOnePartialWarp<ProbBits>(
-          valid, state, sym, outOffset, outWords, table);
+          valid, state, sym, table_idx, outOffset, outWords, table);
     }
   }
 
@@ -290,12 +298,13 @@ struct ANSEncodeWarpFullBlock<ProbBits, BlockSize, false> {
       uint32_t laneId,
       // Input for this block
       const ANSDecodedT* __restrict__ in,
+      const uint32_t* __restrict__ index,
       // encoded table in smem
       const uint4* __restrict__ table,
       // Output for this block
       ANSWarpState* __restrict__ out) {
     // Just use the normal implementation
-    return ansEncodeWarpBlock<ProbBits>(laneId, in, BlockSize, table, out);
+    return ansEncodeWarpBlock<ProbBits>(laneId, in, index, BlockSize, table, out);
   }
 };
 
@@ -303,6 +312,7 @@ template <int ProbBits, int BlockSize>
 __device__ void ansEncodeBlocksFull(
     // input data for all blocks
     const ANSDecodedT* __restrict__ in,
+    const uint32_t* __restrict__ index,
     // length in ANSDecodedT words
     uint32_t uncompressedWords,
     // number of blocks that different warps will process
@@ -322,11 +332,10 @@ __device__ void ansEncodeBlocksFull(
       __shfl_sync(0xffffffff, (blockIdx.x * blockDim.x + tid) / kWarpSize, 0);
   int laneId = getLaneId();
 
-  __shared__ uint4 smemLookup[kNumSymbols];
+  __shared__ uint4 smemLookup[kNumTables * kNumSymbols];
 
-  // we always have at least 256 threads
-  if (tid < kNumSymbols) {
-    smemLookup[tid] = table[tid];
+  for (int i = tid; i < kNumTables * kNumSymbols; i += blockDim.x) {
+    smemLookup[i] = table[i];
   }
 
   __syncthreads();
@@ -344,13 +353,14 @@ __device__ void ansEncodeBlocksFull(
   }
 
   auto inBlock = in + start;
+  auto indexBlock = index + start;
   auto outBlock = (ANSWarpState*)(out + block * outBlockStride);
 
   // all input blocks must meet alignment requirements
   assert(isPointerAligned(inBlock, kANSRequiredAlignment));
-
+  
   auto outWords = ANSEncodeWarpFullBlock<ProbBits, BlockSize, false>::encode(
-      laneId, inBlock, smemLookup, outBlock);
+      laneId, inBlock, indexBlock, smemLookup, outBlock);
 
   if (laneId == 0) {
     // If the bound on max compressed size is not correct, this assert will go
@@ -366,6 +376,7 @@ template <int ProbBits, int BlockSize>
 __device__ void ansEncodeBlocksPartial(
     // input data for all blocks
     const ANSDecodedT* __restrict__ in,
+    const uint32_t* __restrict__ index,
     // length in ANSDecodedT words
     uint32_t uncompressedWords,
     // number of blocks that different warps will process
@@ -382,11 +393,10 @@ __device__ void ansEncodeBlocksPartial(
   uint32_t tid = threadIdx.x;
   int laneId = getLaneId();
 
-  __shared__ uint4 smemLookup[kNumSymbols];
+  __shared__ uint4 smemLookup[kNumTables * kNumSymbols];
 
-  // we always have at least 256 threads
-  if (tid < kNumSymbols) {
-    smemLookup[tid] = table[tid];
+  for (int i = tid; i < kNumTables * kNumSymbols; i += blockDim.x) {
+    smemLookup[i] = table[i];
   }
 
   __syncthreads();
@@ -409,13 +419,14 @@ __device__ void ansEncodeBlocksPartial(
   }
 
   auto inBlock = in + start;
+  auto indexBlock = index + start;
   auto outBlock = (ANSWarpState*)(out + block * outBlockStride);
 
   // all input blocks must meet required alignment
   assert(isPointerAligned(inBlock, kANSRequiredAlignment));
 
   auto outWords = ansEncodeWarpBlock<ProbBits>(
-      laneId, inBlock, blockSize, smemLookup, outBlock);
+      laneId, inBlock, indexBlock, blockSize, smemLookup, outBlock);
 
   if (laneId == 0) {
     // If the bound on max compressed size is not correct, this assert will go
@@ -431,6 +442,8 @@ template <typename InProvider, int ProbBits, int BlockSize>
 __global__ void ansEncodeBatchFull(
     // Input data for all blocks
     InProvider inProvider,
+    // symbol table index for all blocks
+    InProvider indexProvider,
     // maximum number of blocks across all the batch
     uint32_t maxNumCompressedBlocks,
     // maximum size of a compressed block
@@ -453,18 +466,20 @@ __global__ void ansEncodeBatchFull(
 
   ansEncodeBlocksFull<ProbBits, BlockSize>(
       (const ANSDecodedT*)inProvider.getBatchStart(batch),
+      (const uint32_t*)indexProvider.getBatchStart(batch),
       curSize,
       numBlocks,
       maxCompressedBlockSize,
       out + batch * maxNumCompressedBlocks * maxCompressedBlockSize,
       compressedWords + batch * maxNumCompressedBlocks,
-      table + batch * kNumSymbols);
+      table + batch * kNumTables * kNumSymbols);
 }
 
 template <typename InProvider, int ProbBits, int BlockSize>
 __global__ void ansEncodeBatchPartial(
     // input data for all blocks
     InProvider inProvider,
+    InProvider indexProvider,
     // maximum number of blocks across all the batch
     uint32_t maxNumCompressedBlocks,
     // maximum size of a compressed block
@@ -487,12 +502,13 @@ __global__ void ansEncodeBatchPartial(
 
   ansEncodeBlocksPartial<ProbBits, BlockSize>(
       (const ANSDecodedT*)inProvider.getBatchStart(batch),
+      (const uint32_t*)indexProvider.getBatchStart(batch),
       inProvider.getBatchSize(batch),
       numBlocks,
       maxCompressedBlockSize,
       out + batch * maxNumCompressedBlocks * maxCompressedBlockSize,
       compressedWords + batch * maxNumCompressedBlocks,
-      table + batch * kNumSymbols);
+      table + batch * kNumTables * kNumSymbols);
 }
 
 template <typename A, int B>
@@ -569,7 +585,7 @@ __device__ void ansEncodeCoalesce(
     auto probsOut = headerOut->getSymbolProbs();
 
     // Write out pdf
-    for (int i = tid; i < kNumSymbols; i += Threads) {
+    for (int i = tid; i < kNumSymbols * kNumTables; i += Threads) {
       probsOut[i] = table[i].x;
     }
   }
@@ -651,7 +667,7 @@ __global__ void ansEncodeCoalesceBatch(
   compressedWordsPrefix += batch * maxNumCompressedBlocks;
   compressedBytes += batch;
   checksum += batch;
-  table += batch * kNumSymbols;
+  table += batch * kNumTables * kNumSymbols;
 
   ansEncodeCoalesce<Threads>(
       inUncoalescedBlocks,
@@ -674,7 +690,8 @@ void ansEncodeBatchDevice(
     const ANSCodecConfig& config,
     uint32_t numInBatch,
     InProvider inProvider,
-    const uint32_t* histogram_dev,
+    const uint32_t* cdfs_dev,
+    InProvider indexProvider,
     uint32_t maxSize,
     OutProvider outProvider,
     uint32_t* outSize_dev,
@@ -684,20 +701,21 @@ void ansEncodeBatchDevice(
       divUp(maxUncompressedWords, kDefaultBlockSize);
 
   // 1. Compute symbol statistics
-  auto table_dev = res.alloc<uint4>(stream, numInBatch * kNumSymbols);
+  auto table_dev = res.alloc<uint4>(stream, numInBatch * kNumTables * kNumSymbols);
 
-  if (histogram_dev) {
+  if (cdfs_dev) {
     // use pre-calculated histogram
     ansCalcWeights(
         numInBatch,
         config.probBits,
         inProvider,
-        histogram_dev,
+        cdfs_dev,
         table_dev.data(),
         stream);
   } else {
+    // TODO: replace histogram with cdfs
     auto tempHistogram_dev =
-        res.alloc<uint32_t>(stream, numInBatch * kNumSymbols);
+        res.alloc<uint32_t>(stream, numInBatch * kNumTables * kNumSymbols);
 
     // need to calculate a histogram
     ansHistogramBatch(numInBatch, inProvider, tempHistogram_dev.data(), stream);
@@ -752,6 +770,7 @@ void ansEncodeBatchDevice(
     ansEncodeBatchFull<InProvider, BITS, kDefaultBlockSize>    \
         <<<gridFull, kThreads, 0, stream>>>(                   \
             inProvider,                                        \
+            indexProvider,                                     \
             maxNumCompressedBlocks,                            \
             uncoalescedBlockStride,                            \
             compressedBlocks_dev.data(),                       \
@@ -761,6 +780,7 @@ void ansEncodeBatchDevice(
     ansEncodeBatchPartial<InProvider, BITS, kDefaultBlockSize> \
         <<<gridPartial, kThreads, 0, stream>>>(                \
             inProvider,                                        \
+            indexProvider,                                     \
             maxNumCompressedBlocks,                            \
             uncoalescedBlockStride,                            \
             compressedBlocks_dev.data(),                       \

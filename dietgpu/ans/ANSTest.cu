@@ -122,6 +122,7 @@ void runBatchPointer(
       numInBatch,
       inPtrs.data(),
       batchSizes.data(),
+      nullptr, // TODO
       nullptr,
       encPtrs.data(),
       outCompressedSize_dev.data(),
@@ -149,6 +150,7 @@ void runBatchPointer(
       res,
       ANSCodecConfig(prec, true),
       numInBatch,
+      (const void**)encPtrs.data(), // TODO
       (const void**)encPtrs.data(),
       decPtrs.data(),
       batchSizes.data(),

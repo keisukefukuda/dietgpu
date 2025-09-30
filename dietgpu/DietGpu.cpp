@@ -150,11 +150,13 @@ std::tuple<torch::Tensor, torch::Tensor, int64_t> compress_data_res(
     bool compressAsFloat,
     StackDeviceMemory& res,
     const std::vector<torch::Tensor>& tIns,
-    const std::optional<torch::Tensor>& histogram_dev,
+    const torch::Tensor& cdfs_dev,
+    const std::vector<torch::Tensor>& tIndexs,
     bool checksum,
     const std::optional<torch::Tensor>& outCompressed,
     const std::optional<torch::Tensor>& outCompressedSizes) {
   TORCH_CHECK(!tIns.empty());
+  TORCH_CHECK(tIndexs.size() == tIns.size());
 
   // All computation will take place on this device
   int dev = tIns.front().get_device();
@@ -185,19 +187,13 @@ std::tuple<torch::Tensor, torch::Tensor, int64_t> compress_data_res(
   }
 
   //
-  // Validate histogram / construct pointer
+  // Validate cdfs_dev
   //
-  const uint32_t* histogram_ptr = nullptr;
-  if (histogram_dev) {
-    TORCH_CHECK(histogram_dev->device().type() == at::kCUDA);
-    TORCH_CHECK(histogram_dev->is_contiguous());
-    TORCH_CHECK(histogram_dev->dtype() == torch::kInt32);
-    TORCH_CHECK(histogram_dev->get_device() == dev);
-
-    histogram_ptr = (const uint32_t*)histogram_dev->data_ptr();
-  } else {
-    histogram_ptr = nullptr;
-  }
+  TORCH_CHECK(cdfs_dev->device().type() == at::kCUDA);
+  TORCH_CHECK(cdfs_dev->is_contiguous());
+  TORCH_CHECK(cdfs_dev->dtype() == torch::kInt32);
+  TORCH_CHECK(cdfs_dev->get_device() == dev);
+  const uint32_t* cdfs_ptr = (const uint32_t*)cdfs_dev->data_ptr();
 
   torch::Tensor comp;
   if (outCompressed) {
@@ -219,13 +215,16 @@ std::tuple<torch::Tensor, torch::Tensor, int64_t> compress_data_res(
   }
 
   auto inPtrs = std::vector<const void*>(tIns.size());
+  auto indexPtrs = std::vector<const void*>(tIns.size());
   auto inSize = std::vector<uint32_t>(tIns.size());
   auto compPtrs = std::vector<void*>(tIns.size());
 
   for (size_t i = 0; i < tIns.size(); ++i) {
     auto& t = tIns[i];
+    auto & idx = tIndexs[i];
 
     inPtrs[i] = t.data_ptr();
+    indexPtrs[i] = idx.data_ptr();
     inSize[i] = compressAsFloat ? t.numel() : (t.numel() * t.element_size());
     compPtrs[i] = (uint8_t*)comp.data_ptr() + i * comp.size(1);
   }
@@ -278,7 +277,8 @@ std::tuple<torch::Tensor, torch::Tensor, int64_t> compress_data_res(
         tIns.size(),
         inPtrs.data(),
         inSize.data(),
-        histogram_ptr,
+        cdfs_ptr,
+        indexPtrs.data(),
         compPtrs.data(),
         // FIXME: int32_t versus uint32_t
         (uint32_t*)sizes.data_ptr(),
@@ -293,7 +293,8 @@ std::tuple<torch::Tensor, torch::Tensor, int64_t> compress_data_res(
 std::tuple<torch::Tensor, torch::Tensor, int64_t> compress_data(
     bool compressAsFloat,
     const std::vector<torch::Tensor>& tIns,
-    const std::optional<torch::Tensor>& histogram_dev,
+    const torch::Tensor& cdfs_dev,
+    const std::vector<torch::Tensor>& tIndexs,
     bool checksum,
     const std::optional<torch::Tensor>& tempMem,
     const std::optional<torch::Tensor>& outCompressed,
@@ -321,13 +322,15 @@ std::tuple<torch::Tensor, torch::Tensor, int64_t> compress_data(
 
   // The rest of the validation takes place here
   return compress_data_res(
-      compressAsFloat, res, tIns, histogram_dev, checksum, outCompressed, outCompressedSizes);
+      compressAsFloat, res, tIns, cdfs_dev, tIndexs, checksum, outCompressed, outCompressedSizes);
 }
 
 std::tuple<std::vector<torch::Tensor>, torch::Tensor, int64_t>
 compress_data_split_size(
     bool compressAsFloat,
     const torch::Tensor& tIn,
+    const torch::Tensor& tCdfs,
+    const torch::Tensor& tIds,
     const torch::Tensor& tSplitSizes,
     bool checksum,
     const std::optional<torch::Tensor>& tempMem,
@@ -461,7 +464,8 @@ compress_data_split_size(
         tIn.data_ptr(),
         // FIXME: int32_t versus uint32_t
         (const uint32_t*)tSplitSizes.data_ptr(),
-        nullptr,
+        (const uint32_t*)tCdfs.data_ptr(),
+        tIds.data_ptr(),
         comp.data_ptr(),
         maxCompressedBytes,
         // FIXME: int32_t versus uint32_t
@@ -479,7 +483,8 @@ compress_data_split_size(
 std::vector<torch::Tensor> compress_data_simple(
     bool compressAsFloat,
     const std::vector<torch::Tensor>& tIns,
-    const std::optional<torch::Tensor>& histogram_dev,
+    const torch::Tensor& cdfs_dev,
+    const std::vector<torch::Tensor>& tIndexs,
     bool checksum,
     const std::optional<int64_t>& tempMem) {
   TORCH_CHECK(!tIns.empty());
@@ -495,13 +500,14 @@ std::vector<torch::Tensor> compress_data_simple(
 
     // rest of validation takes place here
     comp = compress_data(
-        compressAsFloat, tIns, histogram_dev, checksum, scratch, std::nullopt, std::nullopt);
+        compressAsFloat, tIns, cdfs_dev, tIndexs, checksum, scratch, std::nullopt, std::nullopt);
   } else {
     // rest of validation takes place here
     comp = compress_data(
         compressAsFloat,
         tIns,
-        histogram_dev,
+        cdfs_dev,
+        tIndexs,
         checksum,
         std::nullopt,
         std::nullopt,
@@ -549,6 +555,7 @@ int64_t decompress_data_res(
     bool compressAsFloat,
     StackDeviceMemory& res,
     const std::vector<torch::Tensor>& tIns,
+    const std::vector<torch::Tensor>& tIndexs,
     const std::vector<torch::Tensor>& tOuts,
     bool checksum,
     const std::optional<torch::Tensor>& outStatus,
@@ -562,12 +569,14 @@ int64_t decompress_data_res(
 
   // Validate input and output
   auto inPtrs = std::vector<const void*>(tIns.size());
+  auto indexPtrs = std::vector<const void*>(tIns.size());
   auto outPtrs = std::vector<void*>(tIns.size());
   auto outCapacity = std::vector<uint32_t>(tOuts.size());
 
   for (size_t i = 0; i < tIns.size(); ++i) {
     auto& tIn = tIns[i];
     auto& tOut = tOuts[i];
+    auto & tIndex = tIndexs[i];
 
     TORCH_CHECK(tIn.device().type() == at::kCUDA);
     TORCH_CHECK(tIn.get_device() == dev);
@@ -576,6 +585,10 @@ int64_t decompress_data_res(
     TORCH_CHECK(tOut.device().type() == at::kCUDA);
     TORCH_CHECK(tOut.get_device() == dev);
     TORCH_CHECK(tOut.is_contiguous());
+
+    TORCH_CHECK(tIndex.device().type() == at::kCUDA);
+    TORCH_CHECK(tIndex.get_device() == dev);
+    TORCH_CHECK(tIndex.is_contiguous());
 
     TORCH_CHECK(tIn.dtype() == torch::kByte);
     if (compressAsFloat) {
@@ -586,6 +599,7 @@ int64_t decompress_data_res(
 
     inPtrs[i] = tIn.data_ptr();
     outPtrs[i] = tOut.data_ptr();
+    indexPtrs[i] = tIndex.data_ptr();
 
     auto outSize =
         compressAsFloat ? tOut.numel() : (tOut.numel() * tOut.element_size());
@@ -644,6 +658,7 @@ int64_t decompress_data_res(
         config,
         tIns.size(),
         inPtrs.data(),
+        indexPtrs.data(),
         outPtrs.data(),
         outCapacity.data(),
         outStatus ? (uint8_t*)outStatus->data_ptr() : nullptr,
@@ -664,6 +679,7 @@ int64_t decompress_data_res(
 int64_t decompress_data(
     bool compressAsFloat,
     const std::vector<torch::Tensor>& tIns,
+    const std::vector<torch::Tensor>& tIndexs,
     const std::vector<torch::Tensor>& tOuts,
     bool checksum,
     const std::optional<torch::Tensor>& tempMem,
@@ -691,12 +707,13 @@ int64_t decompress_data(
 
   // Rest of validation happens here
   return decompress_data_res(
-      compressAsFloat, res, tIns, tOuts, checksum, outStatus, outSizes);
+      compressAsFloat, res, tIns, tIndexs, tOuts, checksum, outStatus, outSizes);
 }
 
 int64_t decompress_data_split_size(
     bool compressAsFloat,
     const std::vector<torch::Tensor>& tIns,
+    const std::vector<torch::Tensor>& tIndexs,
     torch::Tensor& tOut,
     const torch::Tensor& tSplitSizes,
     bool checksum,
@@ -819,6 +836,7 @@ int64_t decompress_data_split_size(
         config,
         numInBatch,
         (const void**)inPtrs.data(),
+        (const void**)tIndexs.data(),
         tOut.data_ptr(),
         splitSizes.data(),
         (uint8_t*)(outStatus ? outStatus->data_ptr() : nullptr),
@@ -839,6 +857,7 @@ int64_t decompress_data_split_size(
 std::vector<torch::Tensor> decompress_data_simple(
     bool compressAsFloat,
     const std::vector<torch::Tensor>& tIns,
+    const std::vector<torch::Tensor>& tIndexs,
     bool checksum,
     const std::optional<int64_t>& tempMem) {
   TORCH_CHECK(!tIns.empty());
@@ -923,7 +942,7 @@ std::vector<torch::Tensor> decompress_data_simple(
   }
 
   decompress_data_res(
-      compressAsFloat, res, tIns, tOuts, checksum, std::nullopt, std::nullopt);
+      compressAsFloat, res, tIns, tIndexs, tOuts, checksum, std::nullopt, std::nullopt);
 
   return tOuts;
 }
@@ -939,19 +958,19 @@ TORCH_LIBRARY_FRAGMENT(dietgpu, m) {
 
   // data compress
   m.def(
-      "compress_data(bool compress_as_float, Tensor[] ts_in, bool checksum=False, Tensor? temp_mem=None, Tensor? out_compressed=None, Tensor? out_compressed_bytes=None) -> (Tensor, Tensor, int)");
+      "compress_data(bool compress_as_float, Tensor[] ts_in, Tensor cdfs, Tensor[] t_indexs, bool checksum=False, Tensor? temp_mem=None, Tensor? out_compressed=None, Tensor? out_compressed_bytes=None) -> (Tensor, Tensor, int)");
   m.def(
-      "compress_data_split_size(bool compress_as_float, Tensor t_in, Tensor t_in_split_sizes, bool checksum=False, Tensor? temp_mem=None, Tensor? out_compressed=None, Tensor? out_compressed_bytes=None) -> (Tensor[], Tensor, int)");
+      "compress_data_split_size(bool compress_as_float, Tensor t_in, Tensor t_cdfs, Tensor t_ids, Tensor t_in_split_sizes, bool checksum=False, Tensor? temp_mem=None, Tensor? out_compressed=None, Tensor? out_compressed_bytes=None) -> (Tensor[], Tensor, int)");
   m.def(
-      "compress_data_simple(bool compress_as_float, Tensor[] ts_in, bool checksum=False, int? temp_mem=67108864) -> Tensor[]");
+      "compress_data_simple(bool compress_as_float, Tensor[] ts_in, Tensor cdfs, Tensor[] t_indexs, bool checksum=False, int? temp_mem=67108864) -> Tensor[]");
 
   // data decompress
   m.def(
-      "decompress_data(bool compress_as_float, Tensor[] ts_in, Tensor[] ts_out, bool checksum=False, Tensor? temp_mem=None, Tensor? out_status=None, Tensor? out_decompressed_words=None) -> (int)");
+      "decompress_data(bool compress_as_float, Tensor[] ts_in, Tensor[] t_indexs, Tensor[] ts_out, bool checksum=False, Tensor? temp_mem=None, Tensor? out_status=None, Tensor? out_decompressed_words=None) -> (int)");
   m.def(
-      "decompress_data_split_size(bool compress_as_float, Tensor[] ts_in, Tensor t_out, Tensor t_out_split_sizes, bool checksum=False, Tensor? temp_mem=None, Tensor? out_status=None, Tensor? out_decompressed_words=None) -> (int)");
+      "decompress_data_split_size(bool compress_as_float, Tensor[] ts_in, Tensor[] t_indexs, Tensor t_out, Tensor t_out_split_sizes, bool checksum=False, Tensor? temp_mem=None, Tensor? out_status=None, Tensor? out_decompressed_words=None) -> (int)");
   m.def(
-      "decompress_data_simple(bool compress_as_float, Tensor[] ts_in, bool checksum=False, int? temp_mem=67108864) -> Tensor[]");
+      "decompress_data_simple(bool compress_as_float, Tensor[] ts_in, Tensor[] t_indexs, bool checksum=False, int? temp_mem=67108864) -> Tensor[]");
 }
 
 TORCH_LIBRARY(dietgpu, m) {

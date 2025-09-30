@@ -114,7 +114,11 @@ void ansEncodeBatchPointer(
     // Optional (can be null): region in device memory of size 256 words
     // containing pre-calculated symbol counts (histogram) of the data to be
     // compressed
-    const uint32_t* histogram_dev,
+    // const uint32_t* histogram_dev,
+
+    const uint32_t* cdfs_dev,
+
+    const void** index,
 
     // Host array with addresses of device pointers for the compressed output
     // arrays. Each out[i] must be a region of memory of size at least
@@ -147,7 +151,11 @@ void ansEncodeBatchSplitSize(
     // Optional (can be null): region in device memory of size 256 words
     // containing pre-calculated symbol counts (histogram) of the data to be
     // compressed
-    const uint32_t* histogram_dev,
+    // const uint32_t* histogram_dev,
+
+    const uint32_t* cdfs_dev,
+
+    const void* index_dev,
 
     // Device pointer to a matrix of at least size
     // numInBatch x getMaxCompressedSize(max(inSplitSizes[i]))
@@ -238,6 +246,8 @@ ANSDecodeStatus ansDecodeBatchPointer(
     // inputs
     const void** in,
 
+    const void** index,
+
     // Host array with addresses of device pointers corresponding to
     // uncompressed outputs
     void** out,
@@ -273,6 +283,8 @@ ANSDecodeStatus ansDecodeBatchSplitSize(
 
     // Host array with addresses of device pointers comprising the batch
     const void** in,
+
+    const void** index,
 
     // Device pointer into a valid region of memory of size at least
     // sum_i(outSplitSizes[i]) bytes

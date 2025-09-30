@@ -305,6 +305,7 @@ template <
 __global__ __launch_bounds__(128) void ansDecodeKernel(
     InProvider inProvider,
     const TableT* __restrict__ table,
+    InProvider indexProvider,
     OutProvider outProvider,
     uint8_t* __restrict__ outSuccess,
     uint32_t* __restrict__ outSize) {
@@ -342,16 +343,18 @@ __global__ __launch_bounds__(128) void ansDecodeKernel(
 
   // Initialize symbol, pdf, cdf tables
   constexpr int kBuckets = 1 << ProbBits;
-  __shared__ TableT lookup[kBuckets];
+  __shared__ TableT lookup[kNumTables * kBuckets];
 
   {
     uint4* lookup4 = (uint4*)lookup;
-    const uint4* table4 = (const uint4*)(table + batch * (1 << ProbBits));
+    const uint4* table4 = (const uint4*)(table + batch *  (kNumTables * (1 << ProbBits)));
+    constexpr int wordsPerTable4 = kBuckets / (sizeof(uint4) / sizeof(TableT));
+    constexpr int wordsTotal4 = kNumTables * wordsPerTable4;
 
     static_assert(isEvenDivisor(kBuckets, Threads * 4), "");
     for (int j = 0;
          // loading by uint4 words
-         j < kBuckets / (Threads * (sizeof(uint4) / sizeof(TableT)));
+         j < wordsTotal4 / Threads;
          ++j) {
       lookup4[j * Threads + tid] = table4[j * Threads + tid];
     }
@@ -364,7 +367,7 @@ __global__ __launch_bounds__(128) void ansDecodeKernel(
   // warp id taking into account warps in the current block
   // do this so the compiler knows it is warp uniform
   int globalWarpId =
-      __shfl_sync(0xffffffff, (blockIdx.x * blockDim.x + tid) / kWarpSize, 0);
+      __shfl_sync(0xffffffff, (blockIdx.x * blockDim.x + tid) / kWarpSize, 0); 
 
   auto warpsPerGrid = gridDim.x * Threads / kWarpSize;
   int laneId = getLaneId();
@@ -412,7 +415,7 @@ __global__ void ansDecodeTable(
   int warpId = tid / kWarpSize;
   int laneId = getLaneId();
 
-  table += batch * (1 << probBits);
+  table += batch * (kNumTables * (1 << probBits));
   auto headerIn = (const ANSCoalescedHeader*)inProvider.getBatchStart(batch);
 
   auto header = *headerIn;
@@ -429,49 +432,52 @@ __global__ void ansDecodeTable(
   }
 
   // Skip to pdf table
-  auto probs = headerIn->getSymbolProbs();
+  auto probsAll = headerIn->getSymbolProbs();
 
   static_assert(Threads >= kNumSymbols, "");
-  uint32_t pdf = tid < kNumSymbols ? probs[tid] : 0;
-  uint32_t cdf = 0;
 
   // Get the CDF from the PDF
   using BlockScan = cub::BlockScan<uint32_t, Threads>;
   __shared__ typename BlockScan::TempStorage tempStorage;
 
-  uint32_t total = 0;
-  // FIXME: don't use cub, we can write both the pdf and cdf to smem with a
-  // single syncthreads
-  BlockScan(tempStorage).ExclusiveSum(pdf, cdf, total);
-
-  uint32_t totalProb = 1 << probBits;
-  assert(totalProb == total); // should be a power of 2
-
   // Broadcast the pdf/cdf values
   __shared__ uint2 smemPdfCdf[kNumSymbols];
 
-  if (tid < kNumSymbols) {
-    smemPdfCdf[tid] = uint2{pdf, cdf};
-  }
+  uint32_t totalProb = 1 << probBits;
+  #pragma unroll
+  for (int t = 0; t < kNumTables; ++t) {
+    const uint16_t* probsT = probsAll + t * kNumSymbols;
+    TableT* tableSliceT = table + t * (1u << probBits);
 
-  __syncthreads();
+    uint32_t pdf = (tid < kNumSymbols) ? probsT[tid] : 0u;
+    uint32_t cdf = 0u, total = 0u;
 
-  // Build the table for each pdf/cdf bucket
-  constexpr int kWarpsPerBlock = Threads / kWarpSize;
+    BlockScan(tempStorage).ExclusiveSum(pdf, cdf, total);
+    if (tid == 0) { assert(total == totalProb); }
 
-  for (int i = warpId; i < kNumSymbols; i += kWarpsPerBlock) {
-    auto v = smemPdfCdf[i];
-
-    auto pdf = v.x;
-    auto begin = v.y;
-    auto end = begin + pdf;
-
-    for (int j = begin + laneId; j < end; j += kWarpSize) {
-      table[j] = packDecodeLookup(
-          i, // symbol
-          pdf, // bucket pdf
-          j - begin); // within-bucket cdf
+    if (tid < kNumSymbols) {
+      smemPdfCdf[tid] = uint2{pdf, cdf};
     }
+    
+    __syncthreads();
+
+    // Build the table for each pdf/cdf bucket 
+    constexpr int kWarpsPerBlock = Threads / kWarpSize;
+
+    for (int i = warpId; i < kNumSymbols; i += kWarpsPerBlock) {
+      auto v = smemPdfCdf[i];
+      auto pdf = v.x;
+      auto begin = v.y;
+      auto end = begin + pdf;
+
+      for (int j = begin + laneId; j < end; j += kWarpSize) {
+        tableSliceT[j] = packDecodeLookup(
+            i, // symbol
+            pdf, // bucket pdf
+            j - begin); // within-bucket cdf
+      }
+    }
+    __syncthreads();
   }
 }
 
@@ -481,12 +487,13 @@ ANSDecodeStatus ansDecodeBatch(
     const ANSCodecConfig& config,
     uint32_t numInBatch,
     const InProvider& inProvider,
+    const InProvider& indexProvider,
     OutProvider& outProvider,
     uint8_t* outSuccess_dev,
     uint32_t* outSize_dev,
     cudaStream_t stream) {
   auto table_dev =
-      res.alloc<TableT>(stream, numInBatch * (1 << config.probBits));
+      res.alloc<TableT>(stream, numInBatch * kNumTables * (1 << config.probBits));
 
   // Build the rANS decoding table from the compression header
   {
@@ -530,6 +537,7 @@ ANSDecodeStatus ansDecodeBatch(
         kDefaultBlockSize><<<grid, kThreads, 0, stream>>>(         \
         inProvider,                                                \
         table_dev.data(),                                          \
+        indexProvider,                                             \
         outProvider,                                               \
         outSuccess_dev,                                            \
         outSize_dev);                                              \

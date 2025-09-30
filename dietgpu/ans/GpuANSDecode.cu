@@ -37,6 +37,7 @@ ANSDecodeStatus ansDecodeBatchStride(
       res,
       config,
       numInBatch,
+      inProvider, // TODO: indexProvider
       inProvider,
       outProvider,
       outSuccess_dev,
@@ -49,6 +50,7 @@ ANSDecodeStatus ansDecodeBatchPointer(
     const ANSCodecConfig& config,
     uint32_t numInBatch,
     const void** in,
+    const void** index,
     void** out,
     const uint32_t* outCapacity,
     uint8_t* outSuccess_dev,
@@ -61,6 +63,8 @@ ANSDecodeStatus ansDecodeBatchPointer(
   if (numInBatch <= kBSLimit) {
     auto inProvider =
         BatchProviderInlinePointer<kBSLimit>(numInBatch, (void**)in);
+    auto indexProvider = 
+        BatchProviderInlinePointer<kBSLimit>(numInBatch, (void**)index);
     auto outProvider = BatchProviderInlinePointerCapacity<kBSLimit>(
         numInBatch, out, outCapacity);
 
@@ -69,6 +73,7 @@ ANSDecodeStatus ansDecodeBatchPointer(
         config,
         numInBatch,
         inProvider,
+        indexProvider,
         outProvider,
         outSuccess_dev,
         outSize_dev,
@@ -112,6 +117,7 @@ ANSDecodeStatus ansDecodeBatchPointer(
       res,
       config,
       numInBatch,
+      inProvider, // TODO: indexProvider
       inProvider,
       outProvider,
       outSuccess_dev,
@@ -124,6 +130,7 @@ ANSDecodeStatus ansDecodeBatchSplitSize(
     const ANSCodecConfig& config,
     uint32_t numInBatch,
     const void** in,
+    const void** index,
     void* out_dev,
     const uint32_t* outSplitSizes,
     uint8_t* outSuccess_dev,
@@ -185,6 +192,7 @@ ANSDecodeStatus ansDecodeBatchSplitSize(
       res,
       config,
       numInBatch,
+      inProvider, // TODO: indexProvider
       inProvider,
       outProvider,
       outSuccess_dev,
